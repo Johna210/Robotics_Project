@@ -3,15 +3,12 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
 
 def generate_launch_description():
     pkg_name = 'lane_painting_path_robot'
     pkg_dir = get_package_share_directory(pkg_name)
-
-    # Load the URDF file
-    urdf_file = os.path.join(pkg_dir, 'urdf', 'robot.urdf.xacro')
     
     # Launch Gazebo
     gazebo = ExecuteProcess(
@@ -19,33 +16,43 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Spawn the robot
+    # Spawn the robot using SDF
     spawn_robot = Node(
         package='ros_gz_sim',
         executable='create',
-        arguments=['-name', 'lane_following_robot',
-                  '-topic', 'robot_description',
-                  '-x', '0',
-                  '-y', '0',
-                  '-z', '0.1'],
+        arguments=[
+            '-file', os.path.join(pkg_dir, 'models', 'robot.sdf'),
+            '-x', '-20',    # Start at the beginning of the track
+            '-y', '0',      # Centered on the road
+            '-z', '0.3',    # Slightly above ground to prevent clipping
+            '-R', '0',      # Roll
+            '-P', '0',      # Pitch
+            '-Y', '0'       # Yaw - facing forward
+        ],
         output='screen'
-    )
-
-    # Robot state publisher
-    robot_state_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='screen',
-        parameters=[{'robot_description': urdf_file}]
     )
 
     # Bridge to connect ROS 2 and Gazebo
     bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        arguments=['/camera/image_raw@sensor_msgs/msg/Image@gz.msgs.Image',
-                  '/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist'],
+        arguments=[
+            # Camera image
+            '/camera/image_raw@sensor_msgs/msg/Image@gz.msgs.Image',
+            # Command velocity
+            '/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist',
+            # Odometry
+            '/model/lane_following_robot/odometry@nav_msgs/msg/Odometry@gz.msgs.Odometry',
+            # TF
+            '/model/lane_following_robot/tf@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V',
+            # Joint states
+            '/model/lane_following_robot/joint_state@sensor_msgs/msg/JointState@gz.msgs.Model'
+        ],
+        remappings=[
+            ('/model/lane_following_robot/odometry', '/odom'),
+            ('/model/lane_following_robot/tf', '/tf'),
+            ('/model/lane_following_robot/joint_state', '/joint_states')
+        ],
         output='screen'
     )
 
@@ -67,7 +74,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         gazebo,
-        robot_state_publisher,
         spawn_robot,
         bridge,
         lane_detection,

@@ -32,13 +32,15 @@ private:
             // Process image for lane detection
             cv::Mat processed_frame = processFrame(frame);
 
+            // Calculate steering command based on lane detection
+            double steering = calculateSteering(processed_frame);
+
             // Publish processed image
             sensor_msgs::msg::Image::SharedPtr output_msg = 
                 cv_bridge::CvImage(msg->header, "bgr8", processed_frame).toImageMsg();
             image_pub_->publish(*output_msg);
 
-            // Calculate steering command based on lane detection
-            double steering = calculateSteering(processed_frame);
+            // Publish control command
             publishCommand(steering);
         }
         catch (cv_bridge::Exception& e) {
@@ -48,54 +50,134 @@ private:
     }
 
     cv::Mat processFrame(const cv::Mat& frame) {
-        cv::Mat processed;
+        cv::Mat processed = frame.clone();
         
+        // Convert to HSV for better yellow and white line detection
+        cv::Mat hsv;
+        cv::cvtColor(processed, hsv, cv::COLOR_BGR2HSV);
+
+        // Define color ranges for yellow and white
+        cv::Scalar yellow_low(20, 100, 100);
+        cv::Scalar yellow_high(30, 255, 255);
+        cv::Scalar white_low(0, 0, 200);
+        cv::Scalar white_high(180, 30, 255);
+
+        // Create masks for yellow and white colors
+        cv::Mat yellow_mask, white_mask;
+        cv::inRange(hsv, yellow_low, yellow_high, yellow_mask);
+        cv::inRange(hsv, white_low, white_high, white_mask);
+
+        // Combine masks
+        cv::Mat color_mask;
+        cv::bitwise_or(yellow_mask, white_mask, color_mask);
+
+        // Apply the mask to the original image
+        cv::Mat masked;
+        cv::bitwise_and(processed, processed, masked, color_mask);
+
         // Convert to grayscale
-        cv::cvtColor(frame, processed, cv::COLOR_BGR2GRAY);
+        cv::Mat gray;
+        cv::cvtColor(masked, gray, cv::COLOR_BGR2GRAY);
 
         // Apply Gaussian blur
-        cv::GaussianBlur(processed, processed, cv::Size(5, 5), 0);
+        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
 
         // Apply Canny edge detection
-        cv::Canny(processed, processed, 50, 150);
+        cv::Mat edges;
+        cv::Canny(gray, edges, 50, 150);
 
-        // Define region of interest
-        cv::Mat mask = cv::Mat::zeros(processed.size(), CV_8UC1);
+        // Define region of interest (ROI)
+        cv::Mat mask = cv::Mat::zeros(edges.size(), CV_8UC1);
         std::vector<cv::Point> roi_points;
-        roi_points.push_back(cv::Point(0, processed.rows));
-        roi_points.push_back(cv::Point(processed.cols, processed.rows));
-        roi_points.push_back(cv::Point(processed.cols/2, processed.rows/2));
+        roi_points.push_back(cv::Point(0, edges.rows));
+        roi_points.push_back(cv::Point(edges.cols, edges.rows));
+        roi_points.push_back(cv::Point(edges.cols * 3/4, edges.rows/2));
+        roi_points.push_back(cv::Point(edges.cols/4, edges.rows/2));
         cv::fillConvexPoly(mask, roi_points, cv::Scalar(255));
 
-        // Apply mask
-        cv::bitwise_and(processed, mask, processed);
+        // Apply ROI mask
+        cv::Mat masked_edges;
+        cv::bitwise_and(edges, mask, masked_edges);
 
-        // Detect lines using Hough transform
+        // Find lines using Hough transform
         std::vector<cv::Vec4i> lines;
-        cv::HoughLinesP(processed, lines, 1, CV_PI/180, 50, 50, 10);
+        cv::HoughLinesP(masked_edges, lines, 1, CV_PI/180, 50, 50, 10);
 
-        // Draw detected lines
-        cv::Mat color_frame;
-        cv::cvtColor(processed, color_frame, cv::COLOR_GRAY2BGR);
-        for(size_t i = 0; i < lines.size(); i++) {
-            cv::Vec4i l = lines[i];
-            cv::line(color_frame, cv::Point(l[0], l[1]), cv::Point(l[2], l[3]), cv::Scalar(0,0,255), 3);
+        // Separate left and right lines
+        std::vector<cv::Vec4i> left_lines, right_lines;
+        for(const auto& line : lines) {
+            cv::Vec4i l = line;
+            double slope = (l[3] - l[1]) / static_cast<double>(l[2] - l[0]);
+            
+            if(std::abs(slope) < 0.1) continue; // Skip horizontal lines
+            
+            if(slope < 0) {
+                left_lines.push_back(l);
+            } else {
+                right_lines.push_back(l);
+            }
         }
 
-        return color_frame;
+        // Draw detected lines on the original frame
+        cv::Mat result = frame.clone();
+        drawLines(result, left_lines, cv::Scalar(255, 0, 0));   // Left lines in blue
+        drawLines(result, right_lines, cv::Scalar(0, 0, 255));  // Right lines in red
+
+        // Store line information for steering calculation
+        left_line_x_ = getAverageX(left_lines);
+        right_line_x_ = getAverageX(right_lines);
+
+        return result;
+    }
+
+    void drawLines(cv::Mat& image, const std::vector<cv::Vec4i>& lines, const cv::Scalar& color) {
+        for(const auto& line : lines) {
+            cv::line(image, cv::Point(line[0], line[1]), 
+                    cv::Point(line[2], line[3]), color, 2);
+        }
+    }
+
+    double getAverageX(const std::vector<cv::Vec4i>& lines) {
+        if(lines.empty()) return -1;
+        
+        double sum_x = 0;
+        for(const auto& line : lines) {
+            sum_x += (line[0] + line[2]) / 2.0;
+        }
+        return sum_x / lines.size();
     }
 
     double calculateSteering(const cv::Mat& processed_frame) {
-        // Simple steering calculation based on the position of detected lines
-        // This is a basic implementation and can be improved
-        double steering = 0.0;
-        // Add your steering calculation logic here
+        if(left_line_x_ < 0 && right_line_x_ < 0) {
+            return 0.0; // No lines detected
+        }
+
+        // Calculate the center point between detected lines
+        double center_x;
+        if(left_line_x_ < 0) {
+            center_x = right_line_x_ - processed_frame.cols/4;
+        } else if(right_line_x_ < 0) {
+            center_x = left_line_x_ + processed_frame.cols/4;
+        } else {
+            center_x = (left_line_x_ + right_line_x_) / 2;
+        }
+
+        // Calculate error from the center of the image
+        double error = center_x - processed_frame.cols/2;
+        
+        // Apply proportional control
+        double kp = 0.002; // Proportional gain
+        double steering = -kp * error;
+        
+        // Limit steering angle
+        steering = std::max(-0.5, std::min(0.5, steering));
+        
         return steering;
     }
 
     void publishCommand(double steering) {
         auto msg = geometry_msgs::msg::Twist();
-        msg.linear.x = 0.2;  // Constant forward velocity
+        msg.linear.x = 0.5;  // Forward velocity
         msg.angular.z = steering;
         cmd_vel_pub_->publish(msg);
     }
@@ -103,6 +185,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    double left_line_x_ = -1;
+    double right_line_x_ = -1;
 };
 
 int main(int argc, char** argv) {

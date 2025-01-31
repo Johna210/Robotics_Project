@@ -4,189 +4,184 @@
 #include <cv_bridge/cv_bridge.hpp>
 #include <image_transport/image_transport.hpp>
 #include <opencv2/opencv.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 class LaneDetectorNode : public rclcpp::Node {
 public:
-    LaneDetectorNode() : Node("lane_detector") {
-        // Create subscriber for camera images
+    LaneDetectorNode() : Node("lane_painter") {
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/camera/image_raw", 10,
             std::bind(&LaneDetectorNode::imageCallback, this, std::placeholders::_1));
-
-        // Create publisher for lane detection visualization
-        image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/lane_detection/image", 10);
-
-        // Create publisher for robot control commands
+            
+        image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/processed_image", 10);
         cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-
-        RCLCPP_INFO(this->get_logger(), "Lane detector node initialized");
+        marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/paint_marker", 10);
+        
+        last_paint_time_ = this->now();
+        paint_offset_ = 0.0;
+        marker_id_ = 0;
+        is_painting_ = true;  // Start painting immediately
+        
+        // Create initial paint line
+        initializePaintLine();
+        
+        // Timer for constant paint rate
+        paint_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100),  // 10Hz update rate
+            std::bind(&LaneDetectorNode::paintTimerCallback, this));
+            
+        RCLCPP_INFO(this->get_logger(), "Paint robot initialized and painting!");
     }
 
 private:
+    void initializePaintLine() {
+        paint_line_.header.frame_id = "world";
+        paint_line_.ns = "paint_line";
+        paint_line_.id = 0;
+        paint_line_.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        paint_line_.action = visualization_msgs::msg::Marker::ADD;
+        paint_line_.pose.orientation.w = 1.0;
+        
+        // Make line thick and bright red
+        paint_line_.scale.x = 0.2;  // 20cm wide line
+        paint_line_.color.r = 1.0;
+        paint_line_.color.g = 0.0;
+        paint_line_.color.b = 0.0;
+        paint_line_.color.a = 1.0;
+        
+        // Never expire
+        paint_line_.lifetime = rclcpp::Duration::from_seconds(0);
+    }
+    
+    void paintTimerCallback() {
+        if (!is_painting_) {
+            RCLCPP_INFO(this->get_logger(), "Not painting currently");
+            return;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Creating paint marker...");
+        
+        // Create paint marker
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "odom";  // Use odom frame for global positioning
+        marker.header.stamp = this->now();
+        marker.ns = "paint";
+        marker.id = marker_id_++;
+        marker.type = visualization_msgs::msg::Marker::MESH_RESOURCE;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        
+        // Set mesh resource (use a simple plane mesh)
+        marker.mesh_resource = "package://lane_painting_path_robot/meshes/paint_plane.dae";
+        marker.mesh_use_embedded_materials = false;
+        
+        // Paint position - at robot's current position
+        marker.pose.position.x = 0.0;
+        marker.pose.position.y = 0.0;
+        marker.pose.position.z = 0.001;  // Just above ground
+        
+        // Flat on ground
+        marker.pose.orientation.x = 0.0;
+        marker.pose.orientation.y = 0.0;
+        marker.pose.orientation.z = 0.0;
+        marker.pose.orientation.w = 1.0;
+        
+        // Very large paint mark
+        marker.scale.x = 3.0;    // 3m long
+        marker.scale.y = 1.0;    // 1m wide
+        marker.scale.z = 0.01;   // 1cm thick
+        
+        // Bright red color
+        marker.color.r = 1.0;
+        marker.color.g = 0.0;
+        marker.color.b = 0.0;
+        marker.color.a = 1.0;
+        
+        // Make markers permanent
+        marker.lifetime = rclcpp::Duration::from_seconds(0);
+        
+        RCLCPP_INFO(this->get_logger(), "Publishing paint marker with ID: %d", marker_id_);
+        marker_pub_->publish(marker);
+        
+        // Add additional markers at different heights for better visibility
+        for(double height = 0.002; height <= 0.01; height += 0.002) {
+            marker.id = marker_id_++;
+            marker.pose.position.z = height;
+            marker.scale.z = 0.002;  // Thinner layers
+            RCLCPP_INFO(this->get_logger(), "Publishing additional layer at height %f", height);
+            marker_pub_->publish(marker);
+        }
+    }
+    
+    cv::Mat processFrame(const cv::Mat& frame) {
+        cv::Mat result = frame.clone();
+        
+        int height = frame.rows;
+        int width = frame.cols;
+        
+        // Draw target line in the center
+        cv::line(result, 
+                cv::Point(width/2, height), 
+                cv::Point(width/2, 0), 
+                cv::Scalar(0, 0, 255), 8);  // Extra thick red guide line
+        
+        // Draw guide lines
+        cv::line(result,
+                cv::Point(width/2 - 50, height),
+                cv::Point(width/2 - 50, 0),
+                cv::Scalar(0, 255, 0), 4);
+        cv::line(result,
+                cv::Point(width/2 + 50, height),
+                cv::Point(width/2 + 50, 0),
+                cv::Scalar(0, 255, 0), 4);
+        
+        // Draw paint status
+        std::string status = is_painting_ ? "PAINTING" : "NOT PAINTING";
+        cv::putText(result, status, cv::Point(10, 30), 
+                   cv::FONT_HERSHEY_SIMPLEX, 1.0, 
+                   is_painting_ ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0), 
+                   2);
+        
+        auto msg = geometry_msgs::msg::Twist();
+        
+        // Slow, steady forward movement
+        msg.linear.x = 0.1;  // 10cm/s
+        
+        // Use gyro-like correction to maintain straight line
+        msg.angular.z = -0.1 * paint_offset_;
+        
+        // Limit angular velocity
+        msg.angular.z = std::max(-0.1, std::min(0.1, msg.angular.z));
+        
+        cmd_vel_pub_->publish(msg);
+        return result;
+    }
+    
     void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
         try {
-            // Convert ROS image to OpenCV image
             cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-            cv::Mat frame = cv_ptr->image;
-
-            // Process image for lane detection
-            cv::Mat processed_frame = processFrame(frame);
-
-            // Calculate steering command based on lane detection
-            double steering = calculateSteering(processed_frame);
-
-            // Publish processed image
+            cv::Mat processed_frame = processFrame(cv_ptr->image);
+            
             sensor_msgs::msg::Image::SharedPtr output_msg = 
                 cv_bridge::CvImage(msg->header, "bgr8", processed_frame).toImageMsg();
             image_pub_->publish(*output_msg);
-
-            // Publish control command
-            publishCommand(steering);
-        }
-        catch (cv_bridge::Exception& e) {
+            
+        } catch (const cv_bridge::Exception& e) {
             RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
-            return;
         }
     }
 
-    cv::Mat processFrame(const cv::Mat& frame) {
-        cv::Mat processed = frame.clone();
-        
-        // Convert to HSV for better yellow and white line detection
-        cv::Mat hsv;
-        cv::cvtColor(processed, hsv, cv::COLOR_BGR2HSV);
-
-        // Define color ranges for yellow and white
-        cv::Scalar yellow_low(20, 100, 100);
-        cv::Scalar yellow_high(30, 255, 255);
-        cv::Scalar white_low(0, 0, 200);
-        cv::Scalar white_high(180, 30, 255);
-
-        // Create masks for yellow and white colors
-        cv::Mat yellow_mask, white_mask;
-        cv::inRange(hsv, yellow_low, yellow_high, yellow_mask);
-        cv::inRange(hsv, white_low, white_high, white_mask);
-
-        // Combine masks
-        cv::Mat color_mask;
-        cv::bitwise_or(yellow_mask, white_mask, color_mask);
-
-        // Apply the mask to the original image
-        cv::Mat masked;
-        cv::bitwise_and(processed, processed, masked, color_mask);
-
-        // Convert to grayscale
-        cv::Mat gray;
-        cv::cvtColor(masked, gray, cv::COLOR_BGR2GRAY);
-
-        // Apply Gaussian blur
-        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
-
-        // Apply Canny edge detection
-        cv::Mat edges;
-        cv::Canny(gray, edges, 50, 150);
-
-        // Define region of interest (ROI)
-        cv::Mat mask = cv::Mat::zeros(edges.size(), CV_8UC1);
-        std::vector<cv::Point> roi_points;
-        roi_points.push_back(cv::Point(0, edges.rows));
-        roi_points.push_back(cv::Point(edges.cols, edges.rows));
-        roi_points.push_back(cv::Point(edges.cols * 3/4, edges.rows/2));
-        roi_points.push_back(cv::Point(edges.cols/4, edges.rows/2));
-        cv::fillConvexPoly(mask, roi_points, cv::Scalar(255));
-
-        // Apply ROI mask
-        cv::Mat masked_edges;
-        cv::bitwise_and(edges, mask, masked_edges);
-
-        // Find lines using Hough transform
-        std::vector<cv::Vec4i> lines;
-        cv::HoughLinesP(masked_edges, lines, 1, CV_PI/180, 50, 50, 10);
-
-        // Separate left and right lines
-        std::vector<cv::Vec4i> left_lines, right_lines;
-        for(const auto& line : lines) {
-            cv::Vec4i l = line;
-            double slope = (l[3] - l[1]) / static_cast<double>(l[2] - l[0]);
-            
-            if(std::abs(slope) < 0.1) continue; // Skip horizontal lines
-            
-            if(slope < 0) {
-                left_lines.push_back(l);
-            } else {
-                right_lines.push_back(l);
-            }
-        }
-
-        // Draw detected lines on the original frame
-        cv::Mat result = frame.clone();
-        drawLines(result, left_lines, cv::Scalar(255, 0, 0));   // Left lines in blue
-        drawLines(result, right_lines, cv::Scalar(0, 0, 255));  // Right lines in red
-
-        // Store line information for steering calculation
-        left_line_x_ = getAverageX(left_lines);
-        right_line_x_ = getAverageX(right_lines);
-
-        return result;
-    }
-
-    void drawLines(cv::Mat& image, const std::vector<cv::Vec4i>& lines, const cv::Scalar& color) {
-        for(const auto& line : lines) {
-            cv::line(image, cv::Point(line[0], line[1]), 
-                    cv::Point(line[2], line[3]), color, 2);
-        }
-    }
-
-    double getAverageX(const std::vector<cv::Vec4i>& lines) {
-        if(lines.empty()) return -1;
-        
-        double sum_x = 0;
-        for(const auto& line : lines) {
-            sum_x += (line[0] + line[2]) / 2.0;
-        }
-        return sum_x / lines.size();
-    }
-
-    double calculateSteering(const cv::Mat& processed_frame) {
-        if(left_line_x_ < 0 && right_line_x_ < 0) {
-            return 0.0; // No lines detected
-        }
-
-        // Calculate the center point between detected lines
-        double center_x;
-        if(left_line_x_ < 0) {
-            center_x = right_line_x_ - processed_frame.cols/4;
-        } else if(right_line_x_ < 0) {
-            center_x = left_line_x_ + processed_frame.cols/4;
-        } else {
-            center_x = (left_line_x_ + right_line_x_) / 2;
-        }
-
-        // Calculate error from the center of the image
-        double error = center_x - processed_frame.cols/2;
-        
-        // Apply proportional control
-        double kp = 0.002; // Proportional gain
-        double steering = -kp * error;
-        
-        // Limit steering angle
-        steering = std::max(-0.5, std::min(0.5, steering));
-        
-        return steering;
-    }
-
-    void publishCommand(double steering) {
-        auto msg = geometry_msgs::msg::Twist();
-        msg.linear.x = 0.5;  // Forward velocity
-        msg.angular.z = steering;
-        cmd_vel_pub_->publish(msg);
-    }
-
+private:
+    rclcpp::Time last_paint_time_;
+    double paint_offset_;
+    int marker_id_;
+    bool is_painting_;
+    rclcpp::TimerBase::SharedPtr paint_timer_;
+    visualization_msgs::msg::Marker paint_line_;
+    
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
-    double left_line_x_ = -1;
-    double right_line_x_ = -1;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
 };
 
 int main(int argc, char** argv) {

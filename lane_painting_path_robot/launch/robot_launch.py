@@ -20,14 +20,17 @@ def generate_launch_description():
     spawn_robot = Node(
         package='ros_gz_sim',
         executable='create',
+        name='spawn_robot',
         arguments=[
+            '-world', 'track_world',
+            '-name', 'robot',
             '-file', os.path.join(pkg_dir, 'models', 'robot.sdf'),
-            '-x', '-20',    # Start at the beginning of the track
-            '-y', '0',      # Centered on the road
-            '-z', '0.3',    # Slightly above ground to prevent clipping
-            '-R', '0',      # Roll
-            '-P', '0',      # Pitch
-            '-Y', '0'       # Yaw - facing forward
+            '-x', '-5.0',
+            '-y', '0.0',
+            '-z', '0.3',
+            '-R', '0',
+            '-P', '0',
+            '-Y', '0'
         ],
         output='screen'
     )
@@ -38,7 +41,7 @@ def generate_launch_description():
         executable='parameter_bridge',
         arguments=[
             # Camera image
-            '/camera/image_raw@sensor_msgs/msg/Image@gz.msgs.Image',
+            '/camera@sensor_msgs/msg/Image@gz.msgs.Image',
             # Command velocity
             '/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist',
             # Odometry
@@ -49,6 +52,7 @@ def generate_launch_description():
             '/model/lane_following_robot/joint_state@sensor_msgs/msg/JointState@gz.msgs.Model'
         ],
         remappings=[
+            ('/camera', '/camera/image_raw'),
             ('/model/lane_following_robot/odometry', '/odom'),
             ('/model/lane_following_robot/tf', '/tf'),
             ('/model/lane_following_robot/joint_state', '/joint_states')

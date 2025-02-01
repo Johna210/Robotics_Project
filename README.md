@@ -2,7 +2,7 @@
 
 **Project Overview:** Lane Painting Path Robot
 **Project Structure**
-The project is a ROS 2 (Robot Operating System 2) based robotics application that simulates a robot capable of following a yellow lane and painting a red line along its path.
+The project is a ROS 2 (Robot Operating System 2) based robotics application that simulates a robot capable of following a certain path and painting a yellow line along its path.
 
 **Key Directories and Files**
 
